@@ -15,6 +15,14 @@ class CarlaEnv:
         self.client.set_timeout(20.0)
 
         self.world = self.client.load_world(town)
+        self.max_steps = 1000
+        self.step_count = 0
+
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05
+        self.world.apply_settings(settings)
+
         self.map = self.world.get_map()
         self.blueprint_library = self.world.get_blueprint_library()
         self.vehicle_bp = self.blueprint_library.filter("model3")[0]
@@ -26,7 +34,7 @@ class CarlaEnv:
         self.collision_flag = False
 
         self.vehicle = None
-        self.action_space = 3
+        self.action_space = 4  # Left, Straight, Right, Brake
         self.state_size = 4
 
         # BALANCED reward coefficients (similar scales)
@@ -45,9 +53,6 @@ class CarlaEnv:
         # Track previous distance for progress reward
         self.prev_target_distance = None
 
-        settings = self.world.get_settings()
-        settings.fixed_delta_seconds = 0.05
-        self.world.apply_settings(settings)
 
     def safe_destroy(self, actor):
         if actor is not None:
@@ -74,6 +79,7 @@ class CarlaEnv:
         self.safe_destroy(self.collision_sensor)
         self.collision_flag = False
         self.prev_target_distance = None
+        self.step_count = 0
 
         self.vehicle = None
         attempts = 0
@@ -94,6 +100,8 @@ class CarlaEnv:
 
         self.collision_flag = False
         self._attach_collision_sensor()
+        for _ in range(5):
+            self.world.tick()
 
         # Set target waypoint ahead
         wp = self.map.get_waypoint(self.vehicle.get_transform().location)
@@ -103,7 +111,6 @@ class CarlaEnv:
         else:
             self._target_location = wp.transform.location
 
-        time.sleep(0.2)
         state = self.get_state()
         self.prev_target_distance = state[3] * self.max_target_distance  # Denormalize for tracking
         return state
@@ -131,6 +138,7 @@ class CarlaEnv:
         return state
 
     def step(self, action):
+        self.step_count += 1
         control = carla.VehicleControl()
 
         # Smoother control actions
@@ -143,6 +151,9 @@ class CarlaEnv:
         elif action == 2:  # Turn right
             control.throttle = 0.5
             control.steer = 0.3
+        elif action == 3:  # break
+            control.throttle = 0.0
+            control.brake = 0.5
         else:
             control.throttle = 0.0
             control.steer = 0.0
@@ -192,6 +203,8 @@ class CarlaEnv:
         # 7. Check if reached target
         if dist_to_target < 2.0:
             reward += 5.0  # Bonus for reaching target
+            done = True
+        if self.step_count >= self.max_steps:
             done = True
 
         return next_state, float(reward), done
