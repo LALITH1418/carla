@@ -10,7 +10,7 @@ import pygame
 
 def init_keybaord():
     pygame.init()
-    screen = pygame.display.set_mode((100, 100))
+    screen = pygame.display.set_mode((600, 600))
     pygame.display.set_caption("CARLA manual control")
 
 def get_keyboard_action():
@@ -30,7 +30,7 @@ def get_keyboard_action():
         action = 1  # Go straight
     return action
 
-def collect_human_data(env, agent, episodes = 5, max_steps = 1000):
+def collect_human_data(env, agent, episodes = 5, max_steps = 10000):
     """Collect episodes of human driving data for pretraining."""
     init_keybaord()
     print(f"Collecting {episodes} episodes of human driving data...")
@@ -84,8 +84,8 @@ def run_eval_episode(env, agent, max_steps=500):
 def train():
     # Initialize environment
     env = CarlaEnv()
-    state_size = env.state_size
-    action_size = env.action_space
+    state_size = None
+    action_size = env.action_size
 
     # Initialize agent with stabilized hyperparameters
     agent = DQNAgent(
@@ -93,7 +93,7 @@ def train():
         action_size=action_size,
         lr=1e-4,
         gamma=0.99,
-        batch_size=64,
+        batch_size=16,
         buffer_size=100000,
         epsilon_start=1.0,
         epsilon_min=0.05,

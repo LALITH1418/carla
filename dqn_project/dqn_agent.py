@@ -6,35 +6,125 @@ import torch.nn as nn
 import torch.optim as optim
 from per_buffer import PrioritizedReplayBuffer
 import os
+import torchvision.models as models
 
-class DQNNet(nn.Module):
-    """Deeper network with layer normalization for stability."""
-    def __init__(self, state_size, action_size):
-        super(DQNNet, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_size, 256),
-            nn.LayerNorm(256),  # Add normalization
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, action_size)
+class ResNetLSTMDQN(nn.Module):
+    """DQN with resnet feature extracor and LSTM for Temporal dependencies"""
+    def __init__(
+        self,
+        action_size,
+        in_channels=3,
+        seq_len=4,
+        lstm_hidden=256,
+        lstm_layers=1,
+        pretrained=True,
+    ):
+        super().__init__()
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1),
         )
-        
-        # Initialize weights properly
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1),
+        )
+        # ---- ResNet backbone ----
+        # Use ResNet18 for speed; you can swap to 34/50 if you want.
+        try:
+        # Newer torchvision (0.13+)
+            from torchvision.models import ResNet18_Weights
+            resnet = models.resnet18(
+                weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+                    )
+        except Exception:
+        # Older torchvision – uses `pretrained` flag
+            resnet = models.resnet18(pretrained=pretrained)
+
+        # If your input channels != 3, adjust first conv
+        if in_channels != 3:
+            conv1 = nn.Conv2d(
+                in_channels,
+                64,
+                kernel_size=7,
+                stride=2,
+                padding=3,
+                bias=False,
+            )
+            with torch.no_grad():
+                # Simple init for conv1 weights when channels != 3
+                nn.init.kaiming_normal_(conv1.weight, nonlinearity="relu")
+            resnet.conv1 = conv1
+
+        # Remove the final FC layer, keep up to global average pooling
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1])  # (B, 512, 1, 1)
+        self.feature_dim = resnet.fc.in_features  # usually 512
+
+        self.seq_len = seq_len
+
+        # ---- LSTM over temporal dimension ----
+        self.lstm = nn.LSTM(
+            input_size=self.feature_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+        )
+
+        # ---- Final linear layer to Q-values ----
+        self.fc = nn.Linear(lstm_hidden, action_size)
 
     def forward(self, x):
-        return self.net(x)
+        """
+        x: (B, T, C, H, W)
+        """
+        # Ensure 5D input
+        if x.dim() != 5:
+            raise ValueError(f"Expected input of shape (B, T, C, H, W), got {x.shape}")
+        x = (x - self.mean) / self.std  # Normalize
+        B, T, C, H, W = x.shape
+        # Merge batch and time for CNN:
+        x = x.view(B * T, C, H, W)  # (B*T, C, H, W)
+
+        # CNN feature extraction
+        feats = self.cnn(x)  # (B*T, feature_dim, 1, 1)
+        feats = feats.view(B, T, self.feature_dim)  # (B, T, F)
+
+        # LSTM over time
+        lstm_out, _ = self.lstm(feats)  # (B, T, H)
+        # Use last timestep output
+        last_out = lstm_out[:, -1, :]  # (B, H)
+
+        # Q-values
+        q_values = self.fc(last_out)  # (B, action_size)
+        return q_values
+    
+# class DQNNet(nn.Module):
+#     """Deeper network with layer normalization for stability."""
+#     def __init__(self, state_size, action_size):
+#         super(DQNNet, self).__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(state_size, 256),
+#             nn.LayerNorm(256),  # Add normalization
+#             nn.ReLU(),
+#             nn.Linear(256, 256),
+#             nn.LayerNorm(256),
+#             nn.ReLU(),
+#             nn.Linear(256, 128),
+#             nn.LayerNorm(128),
+#             nn.ReLU(),
+#             nn.Linear(128, action_size)
+#         )
+        
+#         # Initialize weights properly
+#         self.apply(self._init_weights)
+    
+#     def _init_weights(self, module):
+#         if isinstance(module, nn.Linear):
+#             nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+#             if module.bias is not None:
+#                 nn.init.constant_(module.bias, 0)
+
+#     def forward(self, x):
+#         return self.net(x)
 
 class DQNAgent:
     def __init__(self,
@@ -43,8 +133,8 @@ class DQNAgent:
                  device=None,
                  lr=1e-4,                # Increased from 3e-5
                  gamma=0.99,             # Standard discount
-                 batch_size=64,          # Reduced for more frequent updates
-                 buffer_size=100000,     # Sufficient size
+                 batch_size=32,          # Reduced for more frequent updates
+                 buffer_size=50000,     # Sufficient size
                  epsilon_start=1.0,
                  epsilon_min=0.05,       # Lower minimum for more exploitation
                  epsilon_decay=0.995,    # Balanced decay
@@ -54,7 +144,13 @@ class DQNAgent:
                  update_every=4,         # Update every N steps (not every step)
                  target_update_freq=1000, # Soft update frequency
                  tau=0.001,              # Soft update rate
-                 model_dir="models"):
+                 model_dir="models",
+                 frame_channels = 3,
+                 frame_stack = 4,
+                 lstm_hidden = 256,
+                 lstm_layers = 1,
+                 resnet_pretrained = True
+                 ):
 
         self.state_size = state_size
         self.action_size = action_size
@@ -77,13 +173,29 @@ class DQNAgent:
         self.beta_frames = beta_frames
         self.frame_idx = 0
 
-        # Networks
-        self.model = DQNNet(state_size, action_size).to(self.device)
-        self.target_model = DQNNet(state_size, action_size).to(self.device)
-        self.target_model.load_state_dict(self.model.state_dict())
-        self.target_model.eval()  # Always in eval mode
+        #Networks: ResNet + LSTM DQN
+        self.model = ResNetLSTMDQN(
+            action_size=action_size,
+            in_channels=frame_channels,
+            seq_len=frame_stack,
+            lstm_hidden=lstm_hidden,
+            lstm_layers=lstm_layers,
+            pretrained=resnet_pretrained,
+        ).to(self.device)
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, eps=1e-5)
+        self.target_model = ResNetLSTMDQN(
+            action_size=action_size,
+            in_channels=frame_channels,
+            seq_len=frame_stack,
+            lstm_hidden=lstm_hidden,
+            lstm_layers=lstm_layers,
+            pretrained=resnet_pretrained,
+        ).to(self.device)
+
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.target_model.eval()
+
+        self.optimizer = optim.Adam(self.model.parameters(), lr = self.lr, eps=1e-5)
         
         # Huber loss for robustness
         self.loss_fn = nn.SmoothL1Loss(reduction='none')
@@ -106,8 +218,16 @@ class DQNAgent:
         if (not exploit) and (random.random() < self.epsilon):
             return random.randint(0, self.action_size - 1)
         
+        if isinstance(state, np.ndarray):
+            state_t = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+        else:
+            state_t = state.float().unsqueeze(0).to(self.device)
+
+        if state_t.dim() == 4:
+            state_t = state_t.unsqueeze(0)
+        elif state_t.dim() != 5:
+            raise ValueError(f"Expected state with 4 or 5 dims, got {state_t.shape}")
         with torch.no_grad():
-            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.model(state_t)
             action = q_values.argmax(dim=1).item()
         return action
